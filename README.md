@@ -30,7 +30,7 @@ Camera (built-in FTPS client) → AWS Transfer Family → S3 (versioned, no-dele
 - An S3 event triggers an arm64 Lambda function that reads EXIF, fixes orientation, writes four web-sized versions, records the frame in DynamoDB, and makes it visible to the client gallery.
 - Clients see watermarked previews through CloudFront. Originals are never reachable through the CDN.
 
-**Result:** a frame shot on location shows up in the client's gallery in about **2.5 seconds**.
+**Delivery time:** In field testing, frames from a 12-megapixel body reached the client gallery about 2–3 seconds after landing in S3. With a 61-megapixel camera in the live beta it was about 11 seconds; image processing itself takes about a second per frame. File size is the main driver of delivery time.
 
 ## Architecture
 
@@ -118,7 +118,7 @@ The biggest single cost was the idle FTPS endpoint, not the traffic. Tearing it 
 ## Results
 
 - **Shipped and running end to end:** camera → FTPS → S3 → Lambda → DynamoDB → CloudFront → client gallery.
-- **About 2.5 seconds** from capture to the client's gallery.
+- **Delivery time:** in field testing, frames from a 12-megapixel body reached the client gallery about 2–3 seconds after landing in S3. With a 61-megapixel camera in the live beta it was about 11 seconds; image processing itself takes about a second per frame. File size is the main driver of delivery time.
 - **Tested on real shoots** with more than one camera model, including burst shooting, and shown in a live demo to working photographers.
 - **Two environments:** staging deploys automatically on merge; production deploys only by manual dispatch, followed by a written verification record.
 - **Monthly AWS spend cut about 95%** by changing how the most expensive resource runs, not by cutting features.
