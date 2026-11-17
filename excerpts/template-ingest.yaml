@@ -1,0 +1,87 @@
+# EXCERPT — AWS SAM template: the ingest function, its failure destination,
+# and the alarm that watches it (trimmed and sanitized).
+#
+# Resource names are generic; IAM policy statements and other resources in the
+# full template are omitted from this excerpt.
+
+Parameters:
+  OpsAlertEmail:
+    Type: String
+    # No Default on purpose: a deploy that omits it fails, instead of creating
+    # an alert topic nobody is subscribed to (a failure that looks like success).
+
+Resources:
+  # S3 does not redeliver a failed event. Once Lambda's async retries are
+  # exhausted, the event is captured here or it is gone.
+  IngestFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days (SQS max): time to notice and replay
+
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ingest'
+      RetentionInDays: 30
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/ingest/
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      # The idempotency lease (70s) is deliberately longer than this timeout,
+      # so a second invocation can't take over a claim that is still working.
+      Timeout: 60
+      MemorySize: 1536
+      LoggingConfig:
+        LogGroup: !Ref IngestLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PipelineTable
+          # Two derivative prefixes, one security boundary: the clean set is
+          # never readable by the CDN; the watermarked set is the only prefix
+          # the media distribution's bucket policy allows.
+          THUMBNAIL_PREFIX: thumbnails/
+          PUBLIC_PREFIX: public/
+      EventInvokeConfig:
+        # A bounded retry window instead of the default six-hour async queue.
+        MaximumEventAgeInSeconds: 900
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt IngestFailureQueue.Arn
+      # Policies: least-privilege statements omitted from this excerpt.
+      # (Read originals by version, write derivatives by prefix, no delete anywhere.)
+
+  OpsAlertTopic:
+    Type: AWS::SNS::Topic
+
+  OpsAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OpsAlertTopic
+      Protocol: email
+      Endpoint: !Ref OpsAlertEmail
+
+  # Any message in the failure queue means a frame needs investigation.
+  IngestDlqBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ingest-dlq-backlog'
+      AlarmDescription: Failed async ingest events are waiting for investigation or replay.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IngestFailureQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertTopic]
+      OKActions: [!Ref OpsAlertTopic]
