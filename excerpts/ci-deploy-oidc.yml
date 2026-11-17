@@ -1,0 +1,90 @@
+# EXCERPT — reusable deploy workflow (simplified and sanitized).
+#
+# One workflow defines HOW a deploy runs; two small callers decide WHICH
+# environment: staging (on push to main) and production (manual dispatch only).
+#
+# The job's `environment` matters for security, not just labeling: GitHub puts
+# it in the OIDC token's subject (repo:<owner>/<repo>:environment:<name>), and
+# each AWS deploy role trusts exactly one environment. A staging run can't
+# assume the production role, even if it tried.
+#
+# Role ARNs, region and stack settings come from per-environment GitHub
+# Variables. Nothing account-specific is committed. Placeholders are in <>.
+
+name: Deploy (shared)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'production | staging'
+        required: true
+        type: string
+      target:
+        description: 'backend-only | frontend-only | both'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    # Lambdas target arm64 and bundle a native image library, so build on an
+    # arm64 runner inside a container that matches the Lambda runtime. A
+    # bare build packages the runner's own binary, which deploys fine and then
+    # fails at invoke with "Invalid ELF header".
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write   # request the short-lived OIDC token
+      contents: read
+
+    steps:
+      # Production only: an allowlist of who may dispatch a deploy, checked
+      # BEFORE any AWS credential is requested. Uses triggering_actor, not
+      # actor — a re-run keeps the original run's actor. Values are passed
+      # through env:, never interpolated into the script body.
+      - name: Verify dispatching actor is allowlisted
+        if: inputs.environment == 'production'
+        env:
+          ACTOR: ${{ github.triggering_actor }}
+          ALLOWED: ${{ vars.DEPLOY_ALLOWLIST }}
+        run: |
+          for name in $ALLOWED; do
+            if [ "$ACTOR" = "$name" ]; then
+              echo "Actor '$ACTOR' is allowlisted, proceeding."; exit 0
+            fi
+          done
+          echo "::error::Deploy blocked: '$ACTOR' is not allowlisted. No AWS credentials were requested."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # Keyless: GitHub's OIDC token is exchanged for temporary credentials
+      # on a role scoped to this environment's resources.
+      - name: Assume deploy role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}   # <role ARN, per environment>
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: sam build (containerized)
+        if: inputs.target == 'backend-only' || inputs.target == 'both'
+        run: sam build --use-container
+
+      - name: sam deploy
+        if: inputs.target == 'backend-only' || inputs.target == 'both'
+        run: |
+          sam deploy \
+            --config-env "${{ vars.SAM_CONFIG_ENV }}" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      # Frontend build + S3 sync + CloudFront invalidation omitted from this excerpt.
